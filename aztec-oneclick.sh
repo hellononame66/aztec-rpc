@@ -174,13 +174,14 @@ EOF
 start_services() {
   echo -e "${CYAN}🚀 Starting Ethereum Sepolia services...${NC}"
   cd "$BASE_DIR"
-  docker compose up -d
+  sudo docker compose up -d
   echo -e "${GREEN}✅ Services started.${NC}"
 }
 
 monitor_sync() {
   echo -e "${CYAN}📡 Monitoring sync status...${NC}"
   while true; do
+    echo "DEBUG: contacting http://$IP_ADDR:8545"
     geth_sync=$(curl -s -X POST -H "Content-Type: application/json" \
       --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' http://$IP_ADDR:8545 || echo "")
     prysm_sync=$(curl -s http://$IP_ADDR:3500/eth/v1/node/syncing || echo "")
@@ -188,33 +189,19 @@ monitor_sync() {
     if [[ "$geth_sync" == *"false"* ]]; then
       echo -e "${GREEN}✅ Geth fully synced.${NC}"
     else
-      current_hex=$(echo "$geth_sync" | jq -r '.result.currentBlock // empty')
-      highest_hex=$(echo "$geth_sync" | jq -r '.result.highestBlock // empty')
-      
-      if [[ -n "$current_hex" && -n "$highest_hex" ]]; then
-        current_dec=$(printf "%d" "$current_hex")
-        highest_dec=$(printf "%d" "$highest_hex")
-        
-        if [[ $highest_dec -gt 0 ]]; then
-          percent=$(awk "BEGIN { pc=100*${current_dec}/${highest_dec}; print pc }")
-          echo -e "${YELLOW}🔄 Geth syncing: Block $current_dec of $highest_dec (~${percent}%)${NC}"
-        else
-          echo -e "${YELLOW}🔄 Geth syncing: Block $current_dec (highest block not available yet)${NC}"
-        fi
-      else
-        echo -e "${YELLOW}🔄 Geth syncing: Waiting for sync data...${NC}"
-      fi
+      current=$(echo "$geth_sync" | jq -r .result.currentBlock)
+      highest=$(echo "$geth_sync" | jq -r .result.highestBlock)
+      percent=$(awk "BEGIN {printf \"%.2f\", (0x${current}/0x${highest})*100}")
+      echo -e "${YELLOW}🔄 Geth syncing: Block $current of $highest (~$percent%)${NC}"
     fi
 
-    distance=$(echo "$prysm_sync" | jq -r '.data.sync_distance // empty')
-    head=$(echo "$prysm_sync" | jq -r '.data.head_slot // empty')
+    distance=$(echo "$prysm_sync" | jq -r '.data.sync_distance' 2>/dev/null || echo "")
+    head=$(echo "$prysm_sync" | jq -r '.data.head_slot' 2>/dev/null || echo "")
 
     if [[ "$distance" == "0" ]]; then
       echo -e "${GREEN}✅ Prysm fully synced.${NC}"
-    elif [[ -n "$distance" ]]; then
-      echo -e "${YELLOW}🔄 Prysm syncing: $distance slots behind (head: $head)${NC}"
     else
-      echo -e "${YELLOW}🔄 Prysm syncing: Waiting for sync data...${NC}"
+      echo -e "${YELLOW}🔄 Prysm syncing: $distance slots behind (head: $head)${NC}"
     fi
 
     [[ "$geth_sync" == *"false"* && "$distance" == "0" ]] && break
@@ -232,46 +219,54 @@ print_endpoints() {
 check_node_status() {
   echo -e "${CYAN}🔍 Checking Ethereum Sepolia node status...${NC}"
   
-  # Fetch Geth sync status
-  geth_sync=$(curl -s -X POST -H "Content-Type: application/json" \
+  # Geth status check
+  geth_response=$(curl -s -X POST -H "Content-Type: application/json" \
     --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' http://$IP_ADDR:8545 || echo "")
   
-  # Fetch Prysm sync status
-  prysm_sync=$(curl -s http://$IP_ADDR:3500/eth/v1/node/syncing || echo "")
-
-  # Check Geth (Execution Layer) sync status
-  if [[ "$geth_sync" == *"false"* ]]; then
-    echo -e "✅ ${GREEN}Geth (Execution Layer) is fully synced.${NC}"
+  if [[ -z "$geth_response" ]]; then
+    echo -e "${RED}⚠️ Geth is not responding. Is the node running?${NC}"
   else
-    # Extract current and highest block numbers
-    current_hex=$(echo "$geth_sync" | jq -r '.result.currentBlock // empty')
-    highest_hex=$(echo "$geth_sync" | jq -r '.result.highestBlock // empty')
-    
-    if [[ -n "$current_hex" && -n "$highest_hex" ]]; then
-      current_dec=$(printf "%d" "$current_hex")
-      highest_dec=$(printf "%d" "$highest_hex")
-      
-      if [[ $highest_dec -gt 0 ]]; then
-        percent=$(awk "BEGIN { pc=100*${current_dec}/${highest_dec}; print pc }")
-        echo -e "🔄 ${YELLOW}Geth is syncing: Block $current_dec of $highest_dec (~${percent}%)${NC}"
+    if echo "$geth_response" | jq -e '.result == false' >/dev/null 2>&1; then
+      echo -e "✅ ${GREEN}Geth (Execution Layer) is fully synced.${NC}"
+    elif echo "$geth_response" | jq -e '.result | type == "object"' >/dev/null 2>&1; then
+      current_hex=$(echo "$geth_response" | jq -r '.result.currentBlock')
+      highest_hex=$(echo "$geth_response" | jq -r '.result.highestBlock')
+      if [[ "$current_hex" == "null" || "$highest_hex" == "null" ]]; then
+        echo -e "${RED}⚠️ Geth returned an unexpected response.${NC}"
       else
-        echo -e "${YELLOW}🔄 Geth syncing: Block $current_dec (highest block not available yet)${NC}"
+        current_dec=$(printf "%d" "$current_hex")
+        highest_dec=$(printf "%d" "$highest_hex")
+        if [[ $highest_dec -gt 0 ]]; then
+          percent=$(awk "BEGIN {printf \"%.2f\", ($current_dec/$highest_dec)*100}")
+          echo -e "🔄 ${YELLOW}Geth is syncing: Block $current_dec of $highest_dec (~$percent%)${NC}"
+        else
+          echo -e "${RED}⚠️ Could not calculate sync progress (highest block is zero).${NC}"
+        fi
       fi
     else
-      echo -e "${RED}⚠️ Could not fetch Geth sync status (missing or invalid values).${NC}"
+      echo -e "${RED}⚠️ Geth returned an error: $(echo "$geth_response" | jq -r '.error.message')${NC}"
     fi
   fi
 
-  # Check Prysm (Consensus Layer) sync status
-  distance=$(echo "$prysm_sync" | jq -r '.data.sync_distance // empty')
-  head=$(echo "$prysm_sync" | jq -r '.data.head_slot // empty')
-
-  if [[ "$distance" == "0" ]]; then
-    echo -e "✅ ${GREEN}Prysm (Consensus Layer) is fully synced.${NC}"
-  elif [[ -n "$distance" ]]; then
-    echo -e "🔄 ${YELLOW}Prysm is syncing: $distance slots behind (head: $head)${NC}"
+  # Prysm status check
+  prysm_response=$(curl -s http://$IP_ADDR:3500/eth/v1/node/syncing || echo "")
+  
+  if [[ -z "$prysm_response" ]]; then
+    echo -e "${RED}⚠️ Prysm is not responding. Is the node running?${NC}"
   else
-    echo -e "${RED}⚠️ Could not fetch Prysm sync status.${NC}"
+    if echo "$prysm_response" | jq -e '.data' >/dev/null 2>&1; then
+      distance=$(echo "$prysm_response" | jq -r '.data.sync_distance')
+      head=$(echo "$prysm_response" | jq -r '.data.head_slot')
+      if [[ "$distance" == "0" ]]; then
+        echo -e "✅ ${GREEN}Prysm (Consensus Layer) is fully synced.${NC}"
+      elif [[ -n "$distance" ]]; then
+        echo -e "🔄 ${YELLOW}Prysm is syncing: $distance slots behind (head: $head)${NC}"
+      else
+        echo -e "${RED}⚠️ Could not fetch Prysm sync status.${NC}"
+      fi
+    else
+      echo -e "${RED}⚠️ Prysm returned an error: $(echo "$prysm_response" | jq -r '.message')${NC}"
+    fi
   fi
   echo ""
 }
@@ -283,51 +278,66 @@ print_rpc_endpoints() {
 
   echo -e "${CYAN}\n🔍 Checking Ethereum Sepolia node status...${NC}"
 
-  geth_sync=$(curl -s -X POST -H "Content-Type: application/json" \
+  geth_response=$(curl -s -X POST -H "Content-Type: application/json" \
     --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' http://$IP_ADDR:8545 || echo "")
-  prysm_sync=$(curl -s http://$IP_ADDR:3500/eth/v1/node/syncing || echo "")
+  prysm_response=$(curl -s http://$IP_ADDR:3500/eth/v1/node/syncing || echo "")
   
-  if [[ "$geth_sync" == *"false"* ]]; then
-    echo -e "✅ ${GREEN}Geth (Execution Layer) is fully synced.${NC}"
-    geth_synced=true
+  # Geth status
+  if [[ -z "$geth_response" ]]; then
+    echo -e "${RED}⚠️ Geth is not responding.${NC}"
+    geth_synced=false
   else
-    current_hex=$(echo "$geth_sync" | jq -r '.result.currentBlock // empty')
-    highest_hex=$(echo "$geth_sync" | jq -r '.result.highestBlock // empty')
-    
-    if [[ -n "$current_hex" && -n "$highest_hex" ]]; then
-      current_dec=$(printf "%d" "$current_hex")
-      highest_dec=$(printf "%d" "$highest_hex")
-      
-      if [[ $highest_dec -gt 0 ]]; then
-        percent=$(awk "BEGIN { pc=100*${current_dec}/${highest_dec}; print pc }")
-        echo -e "🔄 ${YELLOW}Geth is syncing: Block $current_dec of $highest_dec (~${percent}%)${NC}"
+    if echo "$geth_response" | jq -e '.result == false' >/dev/null 2>&1; then
+      echo -e "✅ ${GREEN}Geth (Execution Layer) is fully synced.${NC}"
+      geth_synced=true
+    elif echo "$geth_response" | jq -e '.result | type == "object"' >/dev/null 2>&1; then
+      current_hex=$(echo "$geth_response" | jq -r '.result.currentBlock')
+      highest_hex=$(echo "$geth_response" | jq -r '.result.highestBlock')
+      if [[ "$current_hex" != "null" && "$highest_hex" != "null" ]]; then
+        current_dec=$(printf "%d" "$current_hex")
+        highest_dec=$(printf "%d" "$highest_hex")
+        if [[ $highest_dec -gt 0 ]]; then
+          percent=$(awk "BEGIN {printf \"%.2f\", ($current_dec/$highest_dec)*100}")
+          echo -e "🔄 ${YELLOW}Geth is syncing: Block $current_dec of $highest_dec (~$percent%)${NC}"
+        else
+          echo -e "${RED}⚠️ Could not calculate sync progress (highest block is zero).${NC}"
+        fi
+      fi
+      geth_synced=false
+    else
+      echo -e "${RED}⚠️ Geth returned an error.${NC}"
+      geth_synced=false
+    fi
+  fi
+
+  # Prysm status
+  if [[ -z "$prysm_response" ]]; then
+    echo -e "${RED}⚠️ Prysm is not responding.${NC}"
+    prysm_synced=false
+  else
+    if echo "$prysm_response" | jq -e '.data' >/dev/null 2>&1; then
+      distance=$(echo "$prysm_response" | jq -r '.data.sync_distance')
+      head=$(echo "$prysm_response" | jq -r '.data.head_slot')
+      if [[ "$distance" == "0" ]]; then
+        echo -e "✅ ${GREEN}Prysm (Consensus Layer) is fully synced.${NC}"
+        prysm_synced=true
+      elif [[ -n "$distance" ]]; then
+        echo -e "🔄 ${YELLOW}Prysm is syncing: $distance slots behind (head: $head)${NC}"
+        prysm_synced=false
       else
-        echo -e "${YELLOW}🔄 Geth syncing: Block $current_dec (highest block not available yet)${NC}"
+        echo -e "${RED}⚠️ Could not fetch Prysm sync status.${NC}"
+        prysm_synced=false
       fi
     else
-      echo -e "${RED}⚠️ Could not fetch Geth sync status (missing or invalid values).${NC}"
+      echo -e "${RED}⚠️ Prysm returned an error.${NC}"
+      prysm_synced=false
     fi
-    geth_synced=false
   fi
 
-  distance=$(echo "$prysm_sync" | jq -r '.data.sync_distance // empty')
-  head=$(echo "$prysm_sync" | jq -r '.data.head_slot // empty')
-  
-  if [[ "$distance" == "0" ]]; then
-    echo -e "✅ ${GREEN}Prysm (Consensus Layer) is fully synced.${NC}"
-    prysm_synced=true
-  elif [[ -n "$distance" ]]; then
-    echo -e "🔄 ${YELLOW}Prysm is syncing: $distance slots behind (head: $head)${NC}"
-    prysm_synced=false
+  if [[ "$geth_synced" == true && "$prysm_synced" == true ]]; then
+    echo -e "${BLUE}\n🎉 Node is fully synced — Powered by AJ💖 ✨${NC}"
   else
-    echo -e "${RED}⚠️ Could not fetch Prysm sync status.${NC}"
-    prysm_synced=false
-  fi
-
-  if [[ "$geth_synced" == false || "$prysm_synced" == false ]]; then
-    echo -e "${RED}⚠️ Node is still syncing. Please wait...${NC}"
-  else
-    echo -e "${BLUE}\n🎉 Setup complete — Powered by AJ💖 ✨${NC}"
+    echo -e "${YELLOW}\n⚠️ Node is still syncing. Please wait...${NC}"
   fi
 }
 
@@ -347,7 +357,7 @@ handle_choice() {
       if [ -f "$BASE_DIR/docker-compose.yml" ]; then
         cd "$BASE_DIR"
         echo -e "${YELLOW}📜 Showing logs... Ctrl+C to exit.${NC}"
-        docker compose logs -f
+        sudo docker compose logs -f
       else
         echo -e "${RED}❌ No docker-compose.yml found. Please run installation first.${NC}"
       fi
